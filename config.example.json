@@ -1,0 +1,11 @@
+﻿{
+    "ping_targets": ["www.baidu.com", "8.8.8.8", "1.1.1.1"],
+    "ping_interval": 3,
+    "packet_loss_threshold": 50,
+    "unstable_threshold": 30,
+    "alert_cooldown": 300,
+    "dingtalk_webhook": "",
+    "dingtalk_secret": "",
+    "enable_sound": true,
+    "log_file": "network_monitor.log"
+}

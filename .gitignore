@@ -1,0 +1,21 @@
+# 敏感配置文件（包含钉钉机器人密钥）
+config.json
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.bak
+
+# 编辑器配置
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Windows 快捷方式
+*.lnk
+
+# PowerShell 历史/配置
+*.ps1xml
