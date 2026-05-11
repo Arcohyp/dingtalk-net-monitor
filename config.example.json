@@ -18,5 +18,6 @@
         "enabled": true,
         "start_time": "22:00",
         "end_time": "08:00"
-    }
+    },
+    "monitor_adapter_switch": true
 }

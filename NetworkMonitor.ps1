@@ -353,6 +353,90 @@ function Test-DoNotDisturb {
     }
 }
 
+# 获取当前默认出网网卡信息
+function Get-DefaultAdapter {
+    try {
+        # 获取 IPv4 默认路由，按 RouteMetric 排序取最优
+        $route = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+            Where-Object { $_.NextHop -and $_.NextHop -ne "0.0.0.0" } |
+            Sort-Object @{Expression = { if ($_.InterfaceMetric) { $_.InterfaceMetric } else { 9999 } } } |
+            Select-Object -First 1
+
+        if (-not $route) {
+            return @{ Name = "无"; InterfaceAlias = "无"; Status = "Down"; IPAddress = ""; Type = "" }
+        }
+
+        $adapter = Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue
+        if (-not $adapter) {
+            return @{ Name = "未知"; InterfaceAlias = "未知"; Status = "Unknown"; IPAddress = ""; Type = "" }
+        }
+
+        $ip = Get-NetIPAddress -InterfaceIndex $route.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty IPAddress
+
+        return @{
+            Name = $adapter.Name
+            InterfaceAlias = $adapter.InterfaceAlias
+            Status = $adapter.Status
+            IPAddress = $ip
+            Type = $adapter.InterfaceDescription
+        }
+    } catch {
+        return @{ Name = "获取失败"; InterfaceAlias = "获取失败"; Status = "Error"; IPAddress = ""; Type = "" }
+    }
+}
+
+# 获取 WiFi 连接状态（使用 netsh）
+function Get-WifiStatus {
+    try {
+        $output = netsh wlan show interfaces 2>$null
+        if ($output -match "没有连接任何无线网络" -or $output -match "There is no wireless interface") {
+            return @{ Connected = $false; SSID = ""; Signal = ""; State = "未连接" }
+        }
+
+        $ssid = ""
+        $signal = ""
+        $state = ""
+
+        foreach ($line in $output) {
+            if ($line -match "\s*SSID\s*:\s*(.+)") { $ssid = $matches[1].Trim() }
+            if ($line -match "\s*Signal\s*:\s*(.+)") { $signal = $matches[1].Trim() }
+            if ($line -match "\s*状态\s*:\s*(.+)") { $state = $matches[1].Trim() }
+            if ($line -match "\s*State\s*:\s*(.+)") { if (-not $state) { $state = $matches[1].Trim() } }
+        }
+
+        return @{
+            Connected = ($ssid -ne "")
+            SSID = $ssid
+            Signal = $signal
+            State = if ($state) { $state } else { "未知" }
+        }
+    } catch {
+        return @{ Connected = $false; SSID = ""; Signal = ""; State = "获取失败" }
+    }
+}
+
+# 构建网卡信息摘要文本
+function Get-AdapterSummary {
+    param(
+        [hashtable]$Adapter,
+        [hashtable]$Wifi
+    )
+
+    $summary = "当前出网网卡: $($Adapter.Name) ($($Adapter.IPAddress))`n"
+    $summary += "网卡类型: $($Adapter.Type)`n"
+
+    if ($Wifi) {
+        if ($Wifi.Connected) {
+            $summary += "WiFi 状态: 已连接 ($($Wifi.SSID)) 信号: $($Wifi.Signal)`n"
+        } else {
+            $summary += "WiFi 状态: $($Wifi.State)`n"
+        }
+    }
+
+    return $summary.TrimEnd()
+}
+
 # 发送勿扰时段摘要
 function Send-Summary {
     if ($script:pendingMessages.Count -eq 0) { return }
@@ -363,16 +447,27 @@ function Send-Summary {
     $disconnects = $script:pendingMessages | Where-Object { $_.Type -eq "disconnect" }
     $unstables = $script:pendingMessages | Where-Object { $_.Type -eq "unstable" }
     $latencies = $script:pendingMessages | Where-Object { $_.Type -eq "latency" }
+    $adapterChanges = $script:pendingMessages | Where-Object { $_.Type -eq "adapter_change" }
 
     $summary = "🌙 勿扰时段网络事件汇总`n"
     $summary += "时间: $($dndStart.ToString('MM-dd HH:mm')) ~ $($dndEnd.ToString('MM-dd HH:mm'))`n`n"
+
+    if ($adapterChanges.Count -gt 0) {
+        $summary += "🔄 网卡切换 $($adapterChanges.Count) 次`n"
+        foreach ($ac in $adapterChanges) {
+            $summary += "   $($ac.Timestamp.ToString('HH:mm:ss')): $($ac.FromName) → $($ac.ToName)`n"
+        }
+        $summary += "`n"
+    }
 
     if ($disconnects.Count -gt 0) {
         $first = $disconnects | Select-Object -First 1
         $last = $disconnects | Select-Object -Last 1
         $summary += "⚠️ 网络断开 $($disconnects.Count) 次`n"
         $summary += "   首次: $($first.Timestamp.ToString('HH:mm:ss'))`n"
-        $summary += "   末次: $($last.Timestamp.ToString('HH:mm:ss'))`n`n"
+        $summary += "   末次: $($last.Timestamp.ToString('HH:mm:ss'))`n"
+        if ($last.AdapterInfo) { $summary += "   出网网卡: $($last.AdapterInfo)`n" }
+        $summary += "`n"
     }
 
     if ($unstables.Count -gt 0) {
@@ -527,6 +622,11 @@ function Monitor-Network {
     $script:pendingMessages = @()
     $script:lastConfigModified = (Get-Item $ConfigFile).LastWriteTime
 
+    # 网卡状态追踪
+    $script:lastAdapter = $null
+    $lastAdapterAlertTime = 0
+    $monitorAdapter = if ($config.PSObject.Properties['monitor_adapter_switch']) { $config.monitor_adapter_switch } else { $true }
+
     while ($true) {
         # 检查配置文件是否更新
         try {
@@ -587,13 +687,44 @@ function Monitor-Network {
         }
         $script:lastDndState = $currentDnd
 
+        # 检测网卡变化
+        $currentAdapter = Get-DefaultAdapter
+        $wifiStatus = Get-WifiStatus
+        $adapterSummary = Get-AdapterSummary -Adapter $currentAdapter -Wifi $wifiStatus
+
+        if ($monitorAdapter -and $script:lastAdapter -and $currentAdapter.Name -ne $script:lastAdapter.Name) {
+            $changeMsg = "🔄 出网网卡切换`n$($script:lastAdapter.Name) ($($script:lastAdapter.IPAddress)) → $($currentAdapter.Name) ($($currentAdapter.IPAddress))"
+            if ($wifiStatus.Connected) {
+                $changeMsg += "`nWiFi: $($wifiStatus.SSID) 信号 $($wifiStatus.Signal)"
+            } elseif ($script:lastAdapter.Name -match "WiFi|WLAN|无线" -or $currentAdapter.Name -match "WiFi|WLAN|无线") {
+                $changeMsg += "`nWiFi 状态: $($wifiStatus.State)"
+            }
+            Write-Log $changeMsg -Level "WARNING"
+            Show-Notification -Title "网卡切换" -Message $changeMsg
+
+            if ($currentDnd) {
+                $script:pendingMessages += [PSCustomObject]@{
+                    Type = "adapter_change"
+                    Timestamp = Get-Date
+                    FromName = $script:lastAdapter.Name
+                    ToName = $currentAdapter.Name
+                }
+                Write-Log "[勿扰] 网卡切换通知已延迟发送" -Level "INFO"
+            } elseif ($currentTime - $lastAdapterAlertTime -ge $config.alert_cooldown) {
+                if (Send-DingtalkMessage -Webhook $config.dingtalk_webhook -Secret $config.dingtalk_secret -Message $changeMsg) {
+                    $lastAdapterAlertTime = $currentTime
+                }
+            }
+        }
+        $script:lastAdapter = $currentAdapter
+
         # 检测网络断开
         if ($avgLoss -ge $config.packet_loss_threshold -and $isConnected) {
             $isConnected = $false
             $lastDisconnectTime = Get-Date
             $disconnectCount++
 
-            $message = "⚠️ 网络连接断开!`n时间: $($lastDisconnectTime.ToString('yyyy-MM-dd HH:mm:ss'))`n平均丢包率: $($avgLoss.ToString('F1'))%"
+            $message = "⚠️ 网络连接断开!`n时间: $($lastDisconnectTime.ToString('yyyy-MM-dd HH:mm:ss'))`n平均丢包率: $($avgLoss.ToString('F1'))%`n$adapterSummary"
             Write-Log $message -Level "WARNING"
             Play-Sound -Enable $config.enable_sound
             Show-Notification -Title "网络断开" -Message $message
@@ -603,6 +734,7 @@ function Monitor-Network {
                     Type = "disconnect"
                     Timestamp = $lastDisconnectTime
                     Loss = $avgLoss
+                    AdapterInfo = "$($currentAdapter.Name) ($($currentAdapter.IPAddress))"
                 }
                 Write-Log "[勿扰] 网络断开通知已延迟发送" -Level "INFO"
             } elseif ($currentTime - $lastAlertTime -ge $config.alert_cooldown) {
@@ -617,7 +749,7 @@ function Monitor-Network {
             $duration = (Get-Date) - $lastDisconnectTime
             $durationStr = "{0:HH:mm:ss}" -f ([datetime]$duration.Ticks)
 
-            $message = "✅ 网络已恢复!`n断开时长: $durationStr`n累计断开次数: $disconnectCount 次"
+            $message = "✅ 网络已恢复!`n断开时长: $durationStr`n累计断开次数: $disconnectCount 次`n$adapterSummary"
             Write-Log $message -Level "INFO"
             Show-Notification -Title "网络恢复" -Message $message
 
@@ -626,6 +758,7 @@ function Monitor-Network {
                     Type = "recover"
                     Timestamp = Get-Date
                     Duration = $durationStr
+                    AdapterInfo = "$($currentAdapter.Name) ($($currentAdapter.IPAddress))"
                 }
                 Write-Log "[勿扰] 网络恢复通知已延迟发送" -Level "INFO"
             } elseif ($currentTime - $lastAlertTime -ge $config.alert_cooldown) {
