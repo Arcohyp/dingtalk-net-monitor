@@ -1,8 +1,14 @@
 # 敏感配置文件（包含钉钉机器人密钥）
 config.json
+.dingtalk_secret
 
-# 日志文件
+# 运行时生成的文件
 *.log
+*.jsonl
+status.html
+
+# 事件日志
+network_events_*.jsonl
 
 # 临时文件
 *.tmp

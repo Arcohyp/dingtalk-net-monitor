@@ -1,5 +1,11 @@
 {
-    "ping_targets": ["www.baidu.com", "8.8.8.8", "1.1.1.1"],
+    "targets": [
+        { "name": "百度Ping", "type": "ping", "host": "www.baidu.com" },
+        { "name": "GoogleDNS-Ping", "type": "ping", "host": "8.8.8.8" },
+        { "name": "Cloudflare-Ping", "type": "ping", "host": "1.1.1.1" },
+        { "name": "百度HTTP", "type": "http", "url": "https://www.baidu.com", "method": "HEAD" },
+        { "name": "DNS测试", "type": "dns", "host": "www.baidu.com", "server": "8.8.8.8" }
+    ],
     "ping_interval": 3,
     "ping_count": 3,
     "ping_timeout": 1000,
@@ -9,7 +15,7 @@
     "latency_warning_threshold": 200,
     "alert_cooldown": 300,
     "dingtalk_webhook": "",
-    "dingtalk_secret": "",
+    "dingtalk_secret_file": ".dingtalk_secret",
     "enable_sound": true,
     "log_file": "network_monitor.log",
     "log_max_size_mb": 10,
@@ -19,5 +25,9 @@
         "start_time": "22:00",
         "end_time": "08:00"
     },
-    "monitor_adapter_switch": true
+    "monitor_adapter_switch": true,
+    "enable_web_panel": false,
+    "web_status_file": "status.html",
+    "enable_event_log": true,
+    "event_log_file": "network_events.jsonl"
 }
