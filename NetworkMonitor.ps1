@@ -16,6 +16,10 @@ param(
     [switch]$Help
 )
 
+# 设置控制台编码为 UTF-8，避免中文乱码
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+
 # ========== 基础工具 ==========
 
 function Invoke-SafeAction {
@@ -143,6 +147,7 @@ function Initialize-Config {
         web_status_file = "status.html"
         enable_event_log = $true
         event_log_file = "network_events.jsonl"
+        latency_alert_cooldown = 3600
     }
 
     Invoke-SafeAction -Action {
@@ -232,6 +237,10 @@ function Test-Config {
     }
     if (-not $Config.PSObject.Properties['event_log_file']) {
         $Config | Add-Member -NotePropertyName event_log_file -NotePropertyValue "network_events.jsonl" -Force
+        $modified = $true
+    }
+    if (-not $Config.PSObject.Properties['latency_alert_cooldown']) {
+        $Config | Add-Member -NotePropertyName latency_alert_cooldown -NotePropertyValue 3600 -Force
         $modified = $true
     }
 
@@ -842,9 +851,13 @@ function Monitor-Network {
         $currentLatencies = $probeResults | Where-Object { $_.Success } | Select-Object -ExpandProperty AvgLatency
         $avgLatency = if ($currentLatencies) { ($currentLatencies | Measure-Object -Average).Average } else { -1 }
 
+        # 延迟告警只看 ping 类型（排除 HTTP/DNS 等应用层延迟干扰）
+        $pingLatencies = $probeResults | Where-Object { $_.Success -and $_.Type -eq "ping" } | Select-Object -ExpandProperty AvgLatency
+        $avgPingLatency = if ($pingLatencies) { ($pingLatencies | Measure-Object -Average).Average } else { -1 }
+
         $packetLoss = ((($totalTargets - $successCount) / $totalTargets) * 100)
         $packetLossHistory += $packetLoss
-        if ($avgLatency -ge 0) { $latencyHistory += $avgLatency }
+        if ($avgPingLatency -ge 0) { $latencyHistory += $avgPingLatency }
         if ($packetLossHistory.Count -gt 10) { $packetLossHistory = $packetLossHistory[1..$packetLossHistory.Count] }
         if ($latencyHistory.Count -gt 10) { $latencyHistory = $latencyHistory[1..$latencyHistory.Count] }
 
@@ -950,18 +963,18 @@ function Monitor-Network {
             }
         }
 
-        # 延迟过高预警
+        # 延迟过高预警（仅基于 ping 类型延迟，使用独立 cooldown）
         if ($isConnected -and $avgHistoryLatency -ge $config.latency_warning_threshold -and $avgHistoryLatency -gt 0) {
-            Write-Log "⚠️ 网络延迟过高，平均延迟: $($avgHistoryLatency.ToString('F0'))ms" -Level "WARNING"
+            Write-Log "⚠️ 网络延迟过高（Ping），平均延迟: $($avgHistoryLatency.ToString('F0'))ms" -Level "WARNING"
             Write-EventLog -Type "latency_alert" -Data @{ latency = $avgHistoryLatency; threshold = $config.latency_warning_threshold }
             if ($currentDnd) {
                 $lastLatency = $script:pendingMessages | Where-Object { $_.Type -eq "latency" } | Select-Object -Last 1
-                if (-not $lastLatency -or ((Get-Date) - $lastLatency.Timestamp).TotalSeconds -ge $config.alert_cooldown) {
+                if (-not $lastLatency -or ((Get-Date) - $lastLatency.Timestamp).TotalSeconds -ge $config.latency_alert_cooldown) {
                     $script:pendingMessages += [PSCustomObject]@{ Type = "latency"; Timestamp = Get-Date; Latency = $avgHistoryLatency }
                     Write-Log "[勿扰] 延迟预警已延迟发送" -Level "INFO"
                 }
-            } elseif ($currentTime - $lastLatencyAlertTime -ge $config.alert_cooldown) {
-                $message = "⏱️ 延迟预警`n时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n平均延迟: $($avgHistoryLatency.ToString('F0'))ms`n阈值: $($config.latency_warning_threshold)ms"
+            } elseif ($currentTime - $lastLatencyAlertTime -ge $config.latency_alert_cooldown) {
+                $message = "⏱️ 延迟预警（Ping）`n时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n平均延迟: $($avgHistoryLatency.ToString('F0'))ms`n阈值: $($config.latency_warning_threshold)ms"
                 if (Send-DingtalkMessage -Webhook $config.dingtalk_webhook -Secret $script:dingtalkSecret -Message $message) { $lastLatencyAlertTime = $currentTime }
             }
         }

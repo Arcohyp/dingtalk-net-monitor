@@ -1,4 +1,4 @@
-{
+﻿{
     "targets": [
         { "name": "百度Ping", "type": "ping", "host": "www.baidu.com" },
         { "name": "GoogleDNS-Ping", "type": "ping", "host": "8.8.8.8" },
