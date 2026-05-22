@@ -2,7 +2,7 @@
 chcp 65001 >nul
 title Add to Startup
 
-set "TARGET_BAT=%~dp0å®ˆæŠ¤è¿›ç¨‹.bat"
+set "TARGET_BAT=%~dp0ÊØ»¤½ø³Ì.bat"
 set "STARTUP_FOLDER=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
 set "SHORTCUT_NAME=Network Monitor Daemon.lnk"
 

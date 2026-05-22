@@ -1,6 +1,6 @@
 ﻿<#
-网络监控程序 - PowerShell 版本
-支持多类型探测(Ping/DNS/HTTP/TCP)、网卡感知、Web面板、结构化日志
+网络监控程序 v2.0.0 - PowerShell 版本
+支持多类型探测(Ping/DNS/HTTP/TCP)、网卡感知、Web面板、结构化日志、并行探测、异步通知
 
 配置文件: config.json (首次启动时会自动引导创建)
 用法: powershell -ExecutionPolicy Bypass -File NetworkMonitor.ps1 [参数]
@@ -16,9 +16,48 @@ param(
     [switch]$Help
 )
 
+$script:Version = "2.0.0"
+
+# 确保工作目录为脚本所在目录
+$script:BaseDir = Split-Path $PSCommandPath -Parent
+Set-Location $script:BaseDir
+
 # 设置控制台编码为 UTF-8，避免中文乱码
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+
+# ========== 进程单例锁 ==========
+
+$script:mutex = $null
+try {
+    $script:mutex = New-Object System.Threading.Mutex($true, "Global\NetworkMonitorDaemon", [ref]$null)
+    if (-not $script:mutex.WaitOne(0, $false)) {
+        Write-Host "错误: 网络监控程序已经在运行中（检测到另一个实例占用全局锁）" -ForegroundColor Red
+        exit 1
+    }
+} catch {
+    Write-Host "警告: 无法创建全局互斥锁，继续运行（可能与其他实例冲突）: $_" -ForegroundColor Yellow
+}
+
+# ========== 正常退出标志 ==========
+
+$script:NormalExit = $false
+$script:StopRequested = $false
+
+function Set-NormalExitFlag {
+    $flagFile = Join-Path $script:BaseDir ".nm_normal_exit"
+    try {
+        [System.IO.File]::WriteAllText($flagFile, "1", [System.Text.Encoding]::UTF8)
+    } catch {}
+}
+
+# 注册 Ctrl+C 处理程序，确保守护进程能识别正常退出
+$cancelEvent = {
+    Set-NormalExitFlag
+    $script:StopRequested = $true
+    $script:NormalExit = $true
+}
+[Console]::add_CancelKeyPress($cancelEvent)
 
 # ========== 基础工具 ==========
 
@@ -35,15 +74,15 @@ function Invoke-SafeAction {
 
 if ($Help) {
     Write-Host ""
-    Write-Host "网络监控程序 - 使用帮助"
-    Write-Host "======================="
+    Write-Host "网络监控程序 v$script:Version - 使用帮助"
+    Write-Host "======================================="
     Write-Host ""
     Write-Host "用法: powershell -ExecutionPolicy Bypass -File NetworkMonitor.ps1 [参数]"
     Write-Host ""
     Write-Host "参数:"
     Write-Host "  [日期]                生成日报，如 2026-05-11（留空则启动监控）"
     Write-Host "  -ConfigFile <路径>    指定配置文件路径（默认: config.json）"
-    Write-Host "  -Silent               静默模式，不显示启动信息"
+    Write-Host "  -Silent               静默模式，不显示启动信息和日常日志"
     Write-Host "  -NoSound              禁用声音警报"
     Write-Host "  -PingInterval <秒>    临时覆盖检测间隔"
     Write-Host "  -Help                 显示此帮助信息"
@@ -102,6 +141,30 @@ function Get-DingtalkSecret {
     return $null
 }
 
+function Get-DingtalkWebhook {
+    param($Config)
+    $webhookFile = ".dingtalk_webhook"
+
+    # 先尝试读取加密文件
+    $webhook = Decrypt-Secret -FilePath $webhookFile
+    if ($webhook) { return $webhook }
+
+    # 向后兼容：从 config.json 迁移
+    if ($Config.dingtalk_webhook -and $Config.dingtalk_webhook -ne "") {
+        $webhook = $Config.dingtalk_webhook
+        try {
+            Encrypt-Secret -Secret $webhook -FilePath $webhookFile
+            $Config.PSObject.Properties.Remove("dingtalk_webhook")
+            $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $ConfigFile -Encoding UTF8
+            Write-Log "已将钉钉 Webhook 迁移到加密文件 $webhookFile" -Level "INFO"
+        } catch {
+            Write-Log "迁移 Webhook 失败: $_" -Level "WARNING"
+        }
+        return $webhook
+    }
+    return $null
+}
+
 # ========== 配置管理 ==========
 
 function Initialize-Config {
@@ -148,6 +211,9 @@ function Initialize-Config {
         enable_event_log = $true
         event_log_file = "network_events.jsonl"
         latency_alert_cooldown = 3600
+        parallel_workers = 4
+        event_log_max_age_days = 30
+        event_log_max_size_mb = 50
     }
 
     Invoke-SafeAction -Action {
@@ -155,6 +221,10 @@ function Initialize-Config {
         if ($secret) {
             Encrypt-Secret -Secret $secret -FilePath ".dingtalk_secret"
             Write-Host "密钥已加密保存到 .dingtalk_secret" -ForegroundColor Green
+        }
+        if ($webhook) {
+            Encrypt-Secret -Secret $webhook -FilePath ".dingtalk_webhook"
+            Write-Host "Webhook 已加密保存到 .dingtalk_webhook" -ForegroundColor Green
         }
         Write-Host ""
         Write-Host "配置已保存到 $ConfigFile"
@@ -190,6 +260,15 @@ function Test-Config {
         Encrypt-Secret -Secret $dingtalkSecret -FilePath $secretFile
         try { $Config.PSObject.Properties.Remove('dingtalk_secret') } catch {}
         $warnings += "已将钉钉 Secret 迁移到加密文件 $secretFile"
+        $modified = $true
+    }
+
+    # 向后兼容: dingtalk_webhook -> 加密文件
+    $dingtalkWebhook = $Config | Select-Object -ExpandProperty dingtalk_webhook -ErrorAction SilentlyContinue
+    if ($dingtalkWebhook -and $dingtalkWebhook -ne "") {
+        Encrypt-Secret -Secret $dingtalkWebhook -FilePath ".dingtalk_webhook"
+        try { $Config.PSObject.Properties.Remove('dingtalk_webhook') } catch {}
+        $warnings += "已将钉钉 Webhook 迁移到加密文件 .dingtalk_webhook"
         $modified = $true
     }
 
@@ -243,6 +322,18 @@ function Test-Config {
         $Config | Add-Member -NotePropertyName latency_alert_cooldown -NotePropertyValue 3600 -Force
         $modified = $true
     }
+    if (-not $Config.PSObject.Properties['parallel_workers']) {
+        $Config | Add-Member -NotePropertyName parallel_workers -NotePropertyValue 4 -Force
+        $modified = $true
+    }
+    if (-not $Config.PSObject.Properties['event_log_max_age_days']) {
+        $Config | Add-Member -NotePropertyName event_log_max_age_days -NotePropertyValue 30 -Force
+        $modified = $true
+    }
+    if (-not $Config.PSObject.Properties['event_log_max_size_mb']) {
+        $Config | Add-Member -NotePropertyName event_log_max_size_mb -NotePropertyValue 50 -Force
+        $modified = $true
+    }
 
     # 阈值校验
     if ($Config.packet_loss_threshold -le 0) {
@@ -263,6 +354,10 @@ function Test-Config {
     if ($Config.ping_interval -lt 1) {
         $warnings += "ping_interval 无效，已自动调整为 3"
         $Config.ping_interval = 3
+        $modified = $true
+    }
+    if ($Config.parallel_workers -lt 1) {
+        $Config.parallel_workers = 4
         $modified = $true
     }
 
@@ -312,25 +407,86 @@ function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logEntry = "[$timestamp] [$Level] $Message"
-    $colorMap = @{ "INFO" = "White"; "WARNING" = "Yellow"; "ERROR" = "Red" }
-    $consoleColor = $colorMap[$Level]; if (-not $consoleColor) { $consoleColor = "White" }
     if ($config -and $config.log_file) {
-        Add-Content -Path $config.log_file -Value $logEntry -Encoding utf8
+        $written = $false
+        for ($i = 0; $i -lt 5; $i++) {
+            try {
+                Add-Content -Path $config.log_file -Value $logEntry -Encoding utf8
+                $written = $true
+                break
+            } catch {
+                if ($i -lt 4) { Start-Sleep -Milliseconds 50 }
+            }
+        }
+        if (-not $written) {
+            Write-Host "[$timestamp] [ERROR] 日志写入失败: 文件持续被占用 ($($config.log_file))" -ForegroundColor Red
+        }
     }
-    Write-Host $logEntry -ForegroundColor $consoleColor
+    if (-not $Silent) {
+        $colorMap = @{ "INFO" = "White"; "WARNING" = "Yellow"; "ERROR" = "Red" }
+        $consoleColor = $colorMap[$Level]; if (-not $consoleColor) { $consoleColor = "White" }
+        Write-Host $logEntry -ForegroundColor $consoleColor
+    }
 }
 
 # ========== 事件日志 ==========
+
+function Rotate-EventLog {
+    param([string]$LogPath, [int]$MaxSizeMB = 50, [int]$MaxBackups = 3)
+    if (-not (Test-Path $LogPath)) { return }
+    $fileInfo = Get-Item $LogPath
+    if (($fileInfo.Length / 1MB) -ge $MaxSizeMB) {
+        $oldestBackup = "$LogPath.$MaxBackups"
+        if (Test-Path $oldestBackup) { Remove-Item $oldestBackup -Force }
+        for ($i = $MaxBackups - 1; $i -ge 1; $i--) {
+            $oldFile = "$LogPath.$i"
+            $newFile = "$LogPath.$($i + 1)"
+            if (Test-Path $oldFile) { Rename-Item $oldFile $newFile -Force }
+        }
+        Rename-Item $LogPath "$LogPath.1" -Force
+    }
+}
+
+function Clean-OldEventLogs {
+    param([string]$BaseFile, [int]$MaxAgeDays)
+    if ($MaxAgeDays -le 0) { return }
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($BaseFile)
+    $dir = Split-Path -Parent $BaseFile
+    if ([string]::IsNullOrEmpty($dir)) { $dir = (Get-Location).Path }
+    $pattern = Join-Path $dir "${baseName}_*.jsonl*"
+    $cutoff = (Get-Date).AddDays(-$MaxAgeDays)
+    Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue | Where-Object {
+        $_.LastWriteTime -lt $cutoff
+    } | ForEach-Object {
+        Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
 
 function Write-EventLog {
     param([string]$Type, [hashtable]$Data)
     if (-not $config.enable_event_log) { return }
     try {
-        $event = @{ time = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss"); type = $Type; data = $Data } | ConvertTo-Json -Compress -Depth 5
+        $event = @{ time = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss.fff"); type = $Type; data = $Data } | ConvertTo-Json -Compress -Depth 5
         $date = Get-Date -Format "yyyy-MM-dd"
         $baseFile = $config.event_log_file -replace '\.jsonl$', ''
         $logPath = "$baseFile`_$date.jsonl"
-        Add-Content -Path $logPath -Value $event -Encoding UTF8
+
+        # 先滚动当日日志
+        Rotate-EventLog -LogPath $logPath -MaxSizeMB $config.event_log_max_size_mb
+
+        $written = $false
+        for ($i = 0; $i -lt 20; $i++) {
+            try {
+                [System.IO.File]::AppendAllText($logPath, $event + [Environment]::NewLine, [System.Text.Encoding]::UTF8)
+                $written = $true
+                break
+            } catch {
+                if ($i -lt 19) { Start-Sleep -Milliseconds 100 }
+            }
+        }
+        if (-not $written) {
+            Write-Log "事件日志写入失败: 文件持续被占用 ($logPath)" -Level "WARNING"
+        }
     } catch {
         Write-Log "事件日志写入失败: $_" -Level "WARNING"
     }
@@ -344,11 +500,15 @@ function Get-DingtalkSignature {
     $timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $stringToSign = "$timestamp`n$Secret"
     $hmac = New-Object System.Security.Cryptography.HMACSHA256
-    $hmac.Key = [System.Text.Encoding]::UTF8.GetBytes($Secret)
-    $hash = $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($stringToSign))
-    $sign = [System.Convert]::ToBase64String($hash)
-    $sign = [System.Uri]::EscapeDataString($sign)
-    return "&timestamp=$timestamp&sign=$sign"
+    try {
+        $hmac.Key = [System.Text.Encoding]::UTF8.GetBytes($Secret)
+        $hash = $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($stringToSign))
+        $sign = [System.Convert]::ToBase64String($hash)
+        $sign = [System.Uri]::EscapeDataString($sign)
+        return "&timestamp=$timestamp&sign=$sign"
+    } finally {
+        $hmac.Dispose()
+    }
 }
 
 function Send-DingtalkMessage {
@@ -374,6 +534,35 @@ function Send-DingtalkMessage {
         Write-Log "钉钉发送异常: $_" -Level "WARNING"
         return $false
     }
+}
+
+function Send-DingtalkMessage-Async {
+    param([string]$Webhook, [string]$Secret, [string]$Message)
+    if (-not $Webhook) { return }
+    $baseDir = $script:BaseDir
+    Start-Job -ScriptBlock {
+        param($url, $secret, $msg, $base)
+        $timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $stringToSign = "$timestamp`n$secret"
+        $hmac = New-Object System.Security.Cryptography.HMACSHA256
+        try {
+            $hmac.Key = [System.Text.Encoding]::UTF8.GetBytes($secret)
+            $hash = $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($stringToSign))
+            $sign = [System.Convert]::ToBase64String($hash)
+            $sign = [System.Uri]::EscapeDataString($sign)
+            $fullUrl = "$url&timestamp=$timestamp&sign=$sign"
+            $body = @{ msgtype = "text"; text = @{ content = $msg } } | ConvertTo-Json -Compress
+            try {
+                Invoke-RestMethod -Uri $fullUrl -Method Post -Body $body -ContentType "application/json; charset=utf-8" -TimeoutSec 10 | Out-Null
+            } catch {
+                $errMsg = $_.Exception.Message
+                $errFile = Join-Path $base "async_dingtalk_errors.log"
+                [System.IO.File]::AppendAllText($errFile, "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] 钉钉异步发送失败: $errMsg`n", [System.Text.Encoding]::UTF8)
+            }
+        } finally {
+            $hmac.Dispose()
+        }
+    } -ArgumentList $Webhook, $Secret, $Message, $baseDir | Out-Null
 }
 
 # ========== 勿扰时段 ==========
@@ -435,6 +624,22 @@ function Get-AdapterSummary {
     return $summary
 }
 
+# 网卡信息缓存
+$script:cachedAdapter = $null
+$script:cachedWifi = $null
+$script:lastAdapterRefresh = [DateTime]::MinValue
+
+function Get-CachedAdapterInfo {
+    param([bool]$ForceRefresh = $false)
+    $now = Get-Date
+    if ($ForceRefresh -or -not $script:lastAdapterRefresh -or ($now - $script:lastAdapterRefresh).TotalSeconds -ge 30) {
+        $script:cachedAdapter = Get-DefaultAdapter
+        $script:cachedWifi = Get-WifiStatus
+        $script:lastAdapterRefresh = $now
+    }
+    return @{ Adapter = $script:cachedAdapter; Wifi = $script:cachedWifi }
+}
+
 function Send-Summary {
     if ($script:pendingMessages.Count -eq 0) { return }
     $dndStart = $script:lastDndStartTime
@@ -473,7 +678,7 @@ function Send-Summary {
     $summary += "共 $($script:pendingMessages.Count) 条事件被延迟通知"
 
     Write-Log $summary -Level "INFO"
-    Send-DingtalkMessage -Webhook $config.dingtalk_webhook -Secret $script:dingtalkSecret -Message $summary
+    Send-DingtalkMessage-Async -Webhook $config.dingtalk_webhook -Secret $script:dingtalkSecret -Message $summary
     $script:pendingMessages = @()
 }
 
@@ -495,42 +700,51 @@ function Show-Notification {
     param([string]$Title, [string]$Message)
     if ($Silent) { return }
     try {
-        Add-Type -AssemblyName System.Windows.Forms
-        $notify = New-Object System.Windows.Forms.NotifyIcon
-        $notify.Icon = [System.Drawing.SystemIcons]::Information
-        $notify.Visible = $true
-        $notify.ShowBalloonTip(10000, $Title, $Message, [System.Windows.Forms.ToolTipIcon]::None)
-        Start-Sleep -Seconds 1
-        $notify.Dispose()
+        Start-Job -ScriptBlock {
+            param($t, $m)
+            Add-Type -AssemblyName System.Windows.Forms
+            $notify = New-Object System.Windows.Forms.NotifyIcon
+            $notify.Icon = [System.Drawing.SystemIcons]::Information
+            $notify.Visible = $true
+            $notify.ShowBalloonTip(10000, $t, $m, [System.Windows.Forms.ToolTipIcon]::None)
+            Start-Sleep -Seconds 12
+            $notify.Dispose()
+        } -ArgumentList $Title, $Message | Out-Null
     } catch {
         Write-Log "显示通知失败: $_" -Level "WARNING"
     }
 }
 
-# ========== 多类型探测 ==========
+# ========== 多类型探测（串行回退）==========
 
 function Test-Target-Ping {
     param($Target, [int]$Count = 3, [int]$TimeoutMs = 1000, [int]$RetryCount = 2)
-    $latencies = @(); $success = $false
-    for ($r = 0; $r -le $RetryCount; $r++) {
-        try {
-            $ping = New-Object System.Net.NetworkInformation.Ping
+    $latencies = @(); $success = $false; $sent = 0; $recv = 0
+    $ping = New-Object System.Net.NetworkInformation.Ping
+    try {
+        for ($r = 0; $r -le $RetryCount; $r++) {
             $ok = 0
             for ($i = 0; $i -lt $Count; $i++) {
-                $reply = $ping.Send($Target.host, $TimeoutMs)
-                if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
-                    $latencies += $reply.RoundtripTime; $ok++
-                }
+                $sent++
+                try {
+                    $reply = $ping.Send($Target.host, $TimeoutMs)
+                    if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                        $latencies += $reply.RoundtripTime; $ok++; $recv++
+                    }
+                } catch {}
             }
             if ($ok -gt 0) { $success = $true; break }
-        } catch {}
-        if ($r -lt $RetryCount) { Start-Sleep -Milliseconds 200 }
+            if ($r -lt $RetryCount) { Start-Sleep -Milliseconds 200 }
+        }
+    } finally {
+        $ping.Dispose()
     }
     $avg = if ($latencies.Count -gt 0) { ($latencies | Measure-Object -Average).Average } else { -1 }
     return [PSCustomObject]@{
         Name = $Target.name; Type = "ping"; Host = $Target.host
         Success = $success; AvgLatency = $avg
-        Detail = if ($success) { "OK, $($latencies.Count)/$Count replies" } else { "No reply" }
+        SentCount = $sent; RecvCount = $recv
+        Detail = if ($success) { "OK, $recv/$sent replies" } else { "No reply" }
     }
 }
 
@@ -547,6 +761,7 @@ function Test-Target-Dns {
         return [PSCustomObject]@{
             Name = $Target.name; Type = "dns"; Host = $Target.host
             Success = $true; AvgLatency = $sw.ElapsedMilliseconds
+            SentCount = 1; RecvCount = 1
             Detail = "Resolved to $($result[0].IPAddress)"
         }
     } catch {
@@ -554,6 +769,7 @@ function Test-Target-Dns {
         return [PSCustomObject]@{
             Name = $Target.name; Type = "dns"; Host = $Target.host
             Success = $false; AvgLatency = -1
+            SentCount = 1; RecvCount = 0
             Detail = $_.Exception.Message
         }
     }
@@ -564,13 +780,19 @@ function Test-Target-Http {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $method = if ($Target.method) { $Target.method } else { "HEAD" }
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $resp = Invoke-WebRequest -Uri $Target.url -Method $method -TimeoutSec ($TimeoutMs / 1000) -UseBasicParsing -ErrorAction Stop
+        $currentProtocol = [Net.ServicePointManager]::SecurityProtocol
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+        try {
+            $resp = Invoke-WebRequest -Uri $Target.url -Method $method -TimeoutSec ($TimeoutMs / 1000) -UseBasicParsing -ErrorAction Stop
+        } finally {
+            [Net.ServicePointManager]::SecurityProtocol = $currentProtocol
+        }
         $sw.Stop()
         return [PSCustomObject]@{
             Name = $Target.name; Type = "http"; Host = $Target.url
             Success = ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400)
             AvgLatency = $sw.ElapsedMilliseconds
+            SentCount = 1; RecvCount = 1
             Detail = "HTTP $($resp.StatusCode)"
         }
     } catch {
@@ -579,6 +801,7 @@ function Test-Target-Http {
         return [PSCustomObject]@{
             Name = $Target.name; Type = "http"; Host = $Target.url
             Success = $false; AvgLatency = $sw.ElapsedMilliseconds
+            SentCount = 1; RecvCount = 0
             Detail = "HTTP $status / $($_.Exception.Message)"
         }
     }
@@ -587,36 +810,204 @@ function Test-Target-Http {
 function Test-Target-Tcp {
     param($Target, [int]$TimeoutMs = 3000)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $client = New-Object System.Net.Sockets.TcpClient
     try {
-        $client = New-Object System.Net.Sockets.TcpClient
         $connect = $client.BeginConnect($Target.host, $Target.port, $null, $null)
         $success = $connect.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
         if ($success) {
             $client.EndConnect($connect)
-            $client.Close()
             $sw.Stop()
             return [PSCustomObject]@{
                 Name = $Target.name; Type = "tcp"; Host = "$($Target.host):$($Target.port)"
-                Success = $true; AvgLatency = $sw.ElapsedMilliseconds; Detail = "Connected"
+                Success = $true; AvgLatency = $sw.ElapsedMilliseconds
+                SentCount = 1; RecvCount = 1; Detail = "Connected"
             }
         } else {
-            $client.Close()
             $sw.Stop()
             return [PSCustomObject]@{
                 Name = $Target.name; Type = "tcp"; Host = "$($Target.host):$($Target.port)"
-                Success = $false; AvgLatency = -1; Detail = "Connection timeout"
+                Success = $false; AvgLatency = -1
+                SentCount = 1; RecvCount = 0; Detail = "Connection timeout"
             }
         }
     } catch {
         $sw.Stop()
         return [PSCustomObject]@{
             Name = $Target.name; Type = "tcp"; Host = "$($Target.host):$($Target.port)"
-            Success = $false; AvgLatency = -1; Detail = $_.Exception.Message
+            Success = $false; AvgLatency = -1
+            SentCount = 1; RecvCount = 0; Detail = $_.Exception.Message
         }
+    } finally {
+        $client.Close()
     }
 }
 
+# ========== 并行探测 ==========
+
 function Test-Targets {
+    param($Targets, $Config)
+    $workers = [math]::Max(1, $Config.parallel_workers)
+    if ($workers -eq 1 -or $Targets.Count -eq 1) {
+        return Test-Targets-Serial -Targets $Targets -Config $Config
+    }
+
+    # 内联探测脚本块，用于在 RunspacePool 中执行
+    $probeScript = {
+        param($target, $pingCount, $pingTimeout, $retryCount)
+        switch ($target.type) {
+            "ping" {
+                $latencies = @(); $success = $false; $sent = 0; $recv = 0
+                $ping = New-Object System.Net.NetworkInformation.Ping
+                try {
+                    for ($r = 0; $r -le $retryCount; $r++) {
+                        $ok = 0
+                        for ($i = 0; $i -lt $pingCount; $i++) {
+                            $sent++
+                            try {
+                                $reply = $ping.Send($target.host, $pingTimeout)
+                                if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                                    $latencies += $reply.RoundtripTime; $ok++; $recv++
+                                }
+                            } catch {}
+                        }
+                        if ($ok -gt 0) { $success = $true; break }
+                        if ($r -lt $retryCount) { Start-Sleep -Milliseconds 200 }
+                    }
+                } finally { $ping.Dispose() }
+                $avg = if ($latencies.Count -gt 0) { ($latencies | Measure-Object -Average).Average } else { -1 }
+                return [PSCustomObject]@{
+                    Name = $target.name; Type = "ping"; Host = $target.host
+                    Success = $success; AvgLatency = $avg
+                    SentCount = $sent; RecvCount = $recv
+                    Detail = if ($success) { "OK, $recv/$sent replies" } else { "No reply" }
+                }
+            }
+            "dns" {
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                try {
+                    if ($target.server) {
+                        $result = Resolve-DnsName -Name $target.host -Server $target.server -ErrorAction Stop
+                    } else {
+                        $result = Resolve-DnsName -Name $target.host -ErrorAction Stop
+                    }
+                    $sw.Stop()
+                    return [PSCustomObject]@{
+                        Name = $target.name; Type = "dns"; Host = $target.host
+                        Success = $true; AvgLatency = $sw.ElapsedMilliseconds
+                        SentCount = 1; RecvCount = 1
+                        Detail = "Resolved to $($result[0].IPAddress)"
+                    }
+                } catch {
+                    $sw.Stop()
+                    return [PSCustomObject]@{
+                        Name = $target.name; Type = "dns"; Host = $target.host
+                        Success = $false; AvgLatency = -1
+                        SentCount = 1; RecvCount = 0
+                        Detail = $_.Exception.Message
+                    }
+                }
+            }
+            "http" {
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                try {
+                    $method = if ($target.method) { $target.method } else { "HEAD" }
+                    $currentProtocol = [Net.ServicePointManager]::SecurityProtocol
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+                    try {
+                        $resp = Invoke-WebRequest -Uri $target.url -Method $method -TimeoutSec ($pingTimeout / 1000) -UseBasicParsing -ErrorAction Stop
+                    } finally {
+                        [Net.ServicePointManager]::SecurityProtocol = $currentProtocol
+                    }
+                    $sw.Stop()
+                    return [PSCustomObject]@{
+                        Name = $target.name; Type = "http"; Host = $target.url
+                        Success = ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400)
+                        AvgLatency = $sw.ElapsedMilliseconds
+                        SentCount = 1; RecvCount = 1
+                        Detail = "HTTP $($resp.StatusCode)"
+                    }
+                } catch {
+                    $sw.Stop()
+                    $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+                    return [PSCustomObject]@{
+                        Name = $target.name; Type = "http"; Host = $target.url
+                        Success = $false; AvgLatency = $sw.ElapsedMilliseconds
+                        SentCount = 1; RecvCount = 0
+                        Detail = "HTTP $status / $($_.Exception.Message)"
+                    }
+                }
+            }
+            "tcp" {
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $client = New-Object System.Net.Sockets.TcpClient
+                try {
+                    $connect = $client.BeginConnect($target.host, $target.port, $null, $null)
+                    $success = $connect.AsyncWaitHandle.WaitOne($pingTimeout, $false)
+                    if ($success) {
+                        $client.EndConnect($connect)
+                        $sw.Stop()
+                        return [PSCustomObject]@{
+                            Name = $target.name; Type = "tcp"; Host = "$($target.host):$($target.port)"
+                            Success = $true; AvgLatency = $sw.ElapsedMilliseconds
+                            SentCount = 1; RecvCount = 1; Detail = "Connected"
+                        }
+                    } else {
+                        $sw.Stop()
+                        return [PSCustomObject]@{
+                            Name = $target.name; Type = "tcp"; Host = "$($target.host):$($target.port)"
+                            Success = $false; AvgLatency = -1
+                            SentCount = 1; RecvCount = 0; Detail = "Connection timeout"
+                        }
+                    }
+                } catch {
+                    $sw.Stop()
+                    return [PSCustomObject]@{
+                        Name = $target.name; Type = "tcp"; Host = "$($target.host):$($target.port)"
+                        Success = $false; AvgLatency = -1
+                        SentCount = 1; RecvCount = 0; Detail = $_.Exception.Message
+                    }
+                } finally { $client.Close() }
+            }
+            default {
+                $hostStr = if ($target.host) { $target.host } elseif ($target.url) { $target.url } else { "unknown" }
+                return [PSCustomObject]@{
+                    Name = $target.name; Type = $target.type; Host = $hostStr
+                    Success = $false; AvgLatency = -1
+                    SentCount = 1; RecvCount = 0
+                    Detail = "Unknown type: $($target.type)"
+                }
+            }
+        }
+    }
+
+    $pool = [runspacefactory]::CreateRunspacePool(1, $workers)
+    $pool.Open()
+    $runspaces = @()
+    foreach ($t in $Targets) {
+        $ps = [powershell]::Create()
+        $ps.RunspacePool = $pool
+        [void]$ps.AddScript($probeScript).AddArgument($t).AddArgument($Config.ping_count).AddArgument($Config.ping_timeout).AddArgument($Config.retry_count)
+        $runspaces += @{ Pipe = $ps; Status = $ps.BeginInvoke() }
+    }
+
+    $results = @()
+    foreach ($rs in $runspaces) {
+        try {
+            $output = $rs.Pipe.EndInvoke($rs.Status)
+            if ($output -and $output.Count -gt 0) { $results += $output[0] }
+        } catch {
+            Write-Log "探测任务异常: $_" -Level "WARNING"
+        } finally {
+            $rs.Pipe.Dispose()
+        }
+    }
+
+    $pool.Close()
+    $pool.Dispose()
+    return $results
+}
+
+function Test-Targets-Serial {
     param($Targets, $Config)
     $results = @()
     foreach ($t in $Targets) {
@@ -627,7 +1018,7 @@ function Test-Targets {
             "tcp"  { $r = Test-Target-Tcp -Target $t -TimeoutMs $Config.ping_timeout }
             default {
                 $hostStr = if ($t.host) { $t.host } elseif ($t.url) { $t.url } else { "unknown" }
-                $r = [PSCustomObject]@{ Name = $t.name; Type = $t.type; Host = $hostStr; Success = $false; AvgLatency = -1; Detail = "Unknown type: $($t.type)" }
+                $r = [PSCustomObject]@{ Name = $t.name; Type = $t.type; Host = $hostStr; Success = $false; AvgLatency = -1; SentCount = 1; RecvCount = 0; Detail = "Unknown type: $($t.type)" }
             }
         }
         $results += $r
@@ -685,7 +1076,7 @@ $wifiHtml
 <table><thead><tr><th>目标</th><th>类型</th><th>状态</th><th>延迟(ms)</th><th>详情</th></tr></thead><tbody>
 $probeRows
 </tbody></table>
-<div class="footer">网络监控程序 | 自动刷新 5s</div>
+<div class="footer">网络监控程序 v$script:Version | 自动刷新 5s</div>
 </div></body></html>
 "@
     return $html
@@ -696,7 +1087,20 @@ function Update-WebStatus {
     if (-not $config.enable_web_panel) { return }
     try {
         $html = Get-WebPanelHtml -Status $Status
-        $html | Set-Content -Path $config.web_status_file -Encoding UTF8
+        $written = $false
+        $filePath = [System.IO.Path]::GetFullPath($config.web_status_file)
+        for ($i = 0; $i -lt 5; $i++) {
+            try {
+                [System.IO.File]::WriteAllText($filePath, $html, [System.Text.Encoding]::UTF8)
+                $written = $true
+                break
+            } catch {
+                if ($i -lt 4) { Start-Sleep -Milliseconds 50 }
+            }
+        }
+        if (-not $written) {
+            Write-Log "更新 Web 状态文件失败: 文件持续被占用 ($($config.web_status_file))" -Level "WARNING"
+        }
     } catch {
         Write-Log "更新 Web 状态文件失败: $_" -Level "WARNING"
     }
@@ -737,7 +1141,6 @@ function Generate-Report {
     Write-Host "  延迟预警次数:    $($latencyAlerts.Count)" -ForegroundColor White
     if ($avgLatency) { Write-Host "  平均延迟:        $([math]::Round($avgLatency, 1)) ms" -ForegroundColor White }
 
-    # 各目标成功率
     Write-Host ""
     Write-Host "  各目标探测统计:" -ForegroundColor Cyan
     $targetStats = @{}
@@ -767,8 +1170,11 @@ function Monitor-Network {
     $global:config = Load-Config
     $global:config = Test-Config -Config $global:config
 
-    # 加载密钥
+    # 加载密钥和 Webhook
     $script:dingtalkSecret = Get-DingtalkSecret -Config $config
+    $script:dingtalkWebhook = Get-DingtalkWebhook -Config $config
+    # 将 webhook 注入 config 供通知函数使用
+    $config | Add-Member -NotePropertyName dingtalk_webhook -NotePropertyValue $script:dingtalkWebhook -Force
 
     # 命令行覆盖
     if ($PingInterval -gt 0) {
@@ -777,9 +1183,12 @@ function Monitor-Network {
     }
 
     if (-not $Silent) {
-        Write-Log "网络监控程序启动" -Level "INFO"
-        Write-Log "探测目标: $($config.targets.Count) 个" -Level "INFO"
-        foreach ($t in $config.targets) { Write-Log "  [$($t.type)] $($t.name) -> $($t.host)$($t.url)$($t.port)" -Level "INFO" }
+        Write-Log "网络监控程序 v$script:Version 启动" -Level "INFO"
+        Write-Log "探测目标: $($config.targets.Count) 个 (并行工作线程: $($config.parallel_workers))" -Level "INFO"
+        foreach ($t in $config.targets) {
+            $dest = if ($t.host) { $t.host } elseif ($t.url) { $t.url } elseif ($t.port) { "$($t.host):$($t.port)" } else { "unknown" }
+            Write-Log "  [$($t.type)] $($t.name) -> $dest" -Level "INFO"
+        }
         Write-Log "丢包阈值: $($config.packet_loss_threshold)%" -Level "INFO"
         Write-Log "延迟警告阈值: $($config.latency_warning_threshold)ms" -Level "INFO"
         Write-Log "钉钉通知: $(if ($config.dingtalk_webhook) { "已配置" } else { "未配置" })" -Level "INFO"
@@ -787,7 +1196,7 @@ function Monitor-Network {
         Write-Log "勿扰模式: $(if ($dndEnabled) { "启用 ($($config.do_not_disturb.start_time) ~ $($config.do_not_disturb.end_time))" } else { "禁用" })" -Level "INFO"
         Write-Log "网卡监控: $(if ($config.monitor_adapter_switch) { "启用" } else { "禁用" })" -Level "INFO"
         Write-Log "Web面板: $(if ($config.enable_web_panel) { "启用 ($($config.web_status_file))" } else { "禁用" })" -Level "INFO"
-        Write-Log "事件日志: $(if ($config.enable_event_log) { "启用" } else { "禁用" })" -Level "INFO"
+        Write-Log "事件日志: $(if ($config.enable_event_log) { "启用 (保留 $($config.event_log_max_age_days) 天)" } else { "禁用" })" -Level "INFO"
     }
 
     # 初始化状态
@@ -824,42 +1233,69 @@ function Monitor-Network {
         Write-Log "Web 状态文件: $($config.web_status_file)" -Level "INFO"
     }
 
-    while ($true) {
+    # 启动时清理过期事件日志（避免每次写入时扫描）
+    if ($config.enable_event_log) {
+        Clean-OldEventLogs -BaseFile $config.event_log_file -MaxAgeDays $config.event_log_max_age_days
+    }
+
+    # 初始化网卡缓存
+    $adapterInfo = Get-CachedAdapterInfo -ForceRefresh $true
+    $script:lastAdapter = $adapterInfo.Adapter
+
+    while (-not $script:StopRequested) {
         # 检查配置文件热重载
         try {
             $currentModified = (Get-Item $ConfigFile).LastWriteTime
             if ($currentModified -gt $script:lastConfigModified) {
-                Write-Log "检测到配置文件更新，正在重新加载..." -Level "WARNING"
-                $oldConfig = $global:config
-                $global:config = Load-Config
-                $global:config = Test-Config -Config $global:config
-                $script:dingtalkSecret = Get-DingtalkSecret -Config $config
-                $script:lastConfigModified = (Get-Item $ConfigFile).LastWriteTime
-                if ($PingInterval -gt 0) { $config.ping_interval = $PingInterval }
-                if (-not $Silent -and ($config.targets | ConvertTo-Json) -ne ($oldConfig.targets | ConvertTo-Json)) {
-                    Write-Log "探测目标已更新" -Level "INFO"
+                # 防抖：确保文件非空且写入完成
+                $fileInfo = Get-Item $ConfigFile
+                if ($fileInfo.Length -gt 0) {
+                    Write-Log "检测到配置文件更新，正在重新加载..." -Level "WARNING"
+                    $oldConfig = $global:config
+                    try {
+                        $newConfig = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+                        $newConfig = Test-Config -Config $newConfig
+                        $global:config = $newConfig
+                        $script:dingtalkSecret = Get-DingtalkSecret -Config $config
+                        $script:dingtalkWebhook = Get-DingtalkWebhook -Config $config
+                        $config | Add-Member -NotePropertyName dingtalk_webhook -NotePropertyValue $script:dingtalkWebhook -Force
+                        $script:lastConfigModified = (Get-Item $ConfigFile).LastWriteTime
+                        if ($PingInterval -gt 0) { $config.ping_interval = $PingInterval }
+                        if (-not $Silent -and ($config.targets | ConvertTo-Json) -ne ($oldConfig.targets | ConvertTo-Json)) {
+                            Write-Log "探测目标已更新" -Level "INFO"
+                        }
+                    } catch {
+                        Write-Log "配置文件热重载失败，继续使用旧配置: $_" -Level "WARNING"
+                        $global:config = $oldConfig
+                        $script:lastConfigModified = (Get-Item $ConfigFile).LastWriteTime
+                    }
                 }
             }
         } catch {
             Write-Log "配置文件检查失败: $_" -Level "WARNING"
         }
 
-        # 执行探测
+        # 执行并行探测
         $probeResults = Test-Targets -Targets $config.targets -Config $config
         $successCount = ($probeResults | Where-Object { $_.Success }).Count
         $totalTargets = $config.targets.Count
         $currentLatencies = $probeResults | Where-Object { $_.Success } | Select-Object -ExpandProperty AvgLatency
         $avgLatency = if ($currentLatencies) { ($currentLatencies | Measure-Object -Average).Average } else { -1 }
 
-        # 延迟告警只看 ping 类型（排除 HTTP/DNS 等应用层延迟干扰）
+        # 延迟告警只看 ping 类型
         $pingLatencies = $probeResults | Where-Object { $_.Success -and $_.Type -eq "ping" } | Select-Object -ExpandProperty AvgLatency
         $avgPingLatency = if ($pingLatencies) { ($pingLatencies | Measure-Object -Average).Average } else { -1 }
 
-        $packetLoss = ((($totalTargets - $successCount) / $totalTargets) * 100)
+        # 丢包率：只统计 ping 类型的真实丢包率
+        $pingResults = $probeResults | Where-Object { $_.Type -eq "ping" }
+        $totalSent = ($pingResults | Measure-Object -Property SentCount -Sum).Sum
+        $totalRecv = ($pingResults | Measure-Object -Property RecvCount -Sum).Sum
+        $packetLoss = if ($totalSent -gt 0) { (($totalSent - $totalRecv) / $totalSent) * 100 } else { 0 }
+
         $packetLossHistory += $packetLoss
         if ($avgPingLatency -ge 0) { $latencyHistory += $avgPingLatency }
-        if ($packetLossHistory.Count -gt 10) { $packetLossHistory = $packetLossHistory[1..$packetLossHistory.Count] }
-        if ($latencyHistory.Count -gt 10) { $latencyHistory = $latencyHistory[1..$latencyHistory.Count] }
+        if ($packetLossHistory.Count -gt 10) { $packetLossHistory = $packetLossHistory | Select-Object -Skip 1 }
+        if ($latencyHistory.Count -gt 10) { $latencyHistory = $latencyHistory | Select-Object -Skip 1 }
 
         $avgLoss = ($packetLossHistory | Measure-Object -Average).Average
         $avgHistoryLatency = if ($latencyHistory) { ($latencyHistory | Measure-Object -Average).Average } else { -1 }
@@ -884,9 +1320,10 @@ function Monitor-Network {
         }
         $script:lastDndState = $currentDnd
 
-        # 检测网卡变化
-        $currentAdapter = Get-DefaultAdapter
-        $wifiStatus = Get-WifiStatus
+        # 检测网卡变化（使用缓存，30秒刷新一次）
+        $adapterInfo = Get-CachedAdapterInfo
+        $currentAdapter = $adapterInfo.Adapter
+        $wifiStatus = $adapterInfo.Wifi
         $adapterSummary = Get-AdapterSummary -Adapter $currentAdapter -Wifi $wifiStatus
 
         if ($monitorAdapter -and $script:lastAdapter -and $currentAdapter.Name -ne $script:lastAdapter.Name) {
@@ -902,7 +1339,8 @@ function Monitor-Network {
                 $script:pendingMessages += [PSCustomObject]@{ Type = "adapter_change"; Timestamp = Get-Date; FromName = $script:lastAdapter.Name; ToName = $currentAdapter.Name }
                 Write-Log "[勿扰] 网卡切换通知已延迟发送" -Level "INFO"
             } elseif ($currentTime - $lastAdapterAlertTime -ge $config.alert_cooldown) {
-                if (Send-DingtalkMessage -Webhook $config.dingtalk_webhook -Secret $script:dingtalkSecret -Message $changeMsg) { $lastAdapterAlertTime = $currentTime }
+                Send-DingtalkMessage-Async -Webhook $config.dingtalk_webhook -Secret $script:dingtalkSecret -Message $changeMsg
+                $lastAdapterAlertTime = $currentTime
             }
         }
         $script:lastAdapter = $currentAdapter
@@ -924,7 +1362,8 @@ function Monitor-Network {
                 $script:pendingMessages += [PSCustomObject]@{ Type = "disconnect"; Timestamp = $lastDisconnectTime; Loss = $avgLoss; AdapterInfo = "$($currentAdapter.Name) ($($currentAdapter.IPAddress))" }
                 Write-Log "[勿扰] 网络断开通知已延迟发送" -Level "INFO"
             } elseif ($currentTime - $lastAlertTime -ge $config.alert_cooldown) {
-                if (Send-DingtalkMessage -Webhook $config.dingtalk_webhook -Secret $script:dingtalkSecret -Message $message) { $lastAlertTime = $currentTime }
+                Send-DingtalkMessage-Async -Webhook $config.dingtalk_webhook -Secret $script:dingtalkSecret -Message $message
+                $lastAlertTime = $currentTime
             }
         }
         # 检测网络恢复
@@ -945,7 +1384,8 @@ function Monitor-Network {
                 $script:pendingMessages += [PSCustomObject]@{ Type = "recover"; Timestamp = Get-Date; Duration = $durationStr; AdapterInfo = "$($currentAdapter.Name) ($($currentAdapter.IPAddress))" }
                 Write-Log "[勿扰] 网络恢复通知已延迟发送" -Level "INFO"
             } elseif ($currentTime - $lastAlertTime -ge $config.alert_cooldown) {
-                if (Send-DingtalkMessage -Webhook $config.dingtalk_webhook -Secret $script:dingtalkSecret -Message $message) { $lastAlertTime = $currentTime }
+                Send-DingtalkMessage-Async -Webhook $config.dingtalk_webhook -Secret $script:dingtalkSecret -Message $message
+                $lastAlertTime = $currentTime
             }
         }
         # 网络不稳定预警
@@ -959,7 +1399,8 @@ function Monitor-Network {
                 }
             } elseif ($currentTime - $lastAlertTime -ge $config.alert_cooldown) {
                 $message = "⚠️ 网络预警`n时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n平均丢包率: $($avgLoss.ToString('F1'))%`n建议检查网络连接"
-                if (Send-DingtalkMessage -Webhook $config.dingtalk_webhook -Secret $script:dingtalkSecret -Message $message) { $lastAlertTime = $currentTime }
+                Send-DingtalkMessage-Async -Webhook $config.dingtalk_webhook -Secret $script:dingtalkSecret -Message $message
+                $lastAlertTime = $currentTime
             }
         }
 
@@ -975,7 +1416,8 @@ function Monitor-Network {
                 }
             } elseif ($currentTime - $lastLatencyAlertTime -ge $config.latency_alert_cooldown) {
                 $message = "⏱️ 延迟预警（Ping）`n时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n平均延迟: $($avgHistoryLatency.ToString('F0'))ms`n阈值: $($config.latency_warning_threshold)ms"
-                if (Send-DingtalkMessage -Webhook $config.dingtalk_webhook -Secret $script:dingtalkSecret -Message $message) { $lastLatencyAlertTime = $currentTime }
+                Send-DingtalkMessage-Async -Webhook $config.dingtalk_webhook -Secret $script:dingtalkSecret -Message $message
+                $lastLatencyAlertTime = $currentTime
             }
         }
 
@@ -997,18 +1439,39 @@ function Monitor-Network {
         # 日志滚动
         Rotate-Log -LogFile $config.log_file -MaxSizeMB $config.log_max_size_mb -MaxBackups $config.log_max_backups
 
-        Start-Sleep -Seconds $config.ping_interval
+        # 清理已完成的异步 Job
+        Get-Job -State Completed | Remove-Job -ErrorAction SilentlyContinue
+        Get-Job -State Failed | Remove-Job -ErrorAction SilentlyContinue
+
+        # 分段睡眠以支持快速响应停止请求
+        $sleepRemain = $config.ping_interval
+        while ($sleepRemain -gt 0 -and -not $script:StopRequested) {
+            $chunk = [Math]::Min($sleepRemain, 1)
+            Start-Sleep -Seconds $chunk
+            $sleepRemain -= $chunk
+        }
     }
 }
 
 # ========== 启动入口 ==========
 
-if ($Report -ne "") {
-    $global:config = Load-Config
-    $global:config = Test-Config -Config $global:config
-    $dateStr = if ($Report -eq "today") { Get-Date -Format "yyyy-MM-dd" } else { $Report }
-    Generate-Report -DateStr $dateStr
-    exit 0
-}
+try {
+    if ($Report -ne "") {
+        $global:config = Load-Config
+        $global:config = Test-Config -Config $global:config
+        $dateStr = if ($Report -eq "today") { Get-Date -Format "yyyy-MM-dd" } else { $Report }
+        Generate-Report -DateStr $dateStr
+        exit 0
+    }
 
-Monitor-Network
+    Monitor-Network
+} finally {
+    $script:NormalExit = $true
+    if ($script:mutex) {
+        try { $script:mutex.ReleaseMutex() } catch {}
+        $script:mutex.Dispose()
+    }
+    Set-NormalExitFlag
+    try { [Console]::remove_CancelKeyPress($cancelEvent) } catch {}
+}
+exit 0

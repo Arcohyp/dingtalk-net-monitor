@@ -1,4 +1,4 @@
-# 网络监控程序 (PowerShell 版本)
+# 网络监控程序 v2.0.0 (PowerShell 版本)
 
 一款轻量级的网络监控工具，支持 Windows 系统，无需安装 Python。支持多类型网络探测、网卡级状态感知、钉钉加密通知、Web 状态面板和结构化日志。
 
@@ -6,7 +6,7 @@
 
 ### 网络探测
 - **多类型探测**：支持 Ping、DNS、HTTP、TCP 四种探测方式，不只是 ICMP 通不通
-- **并行化探测**：多个目标并行测试，提升检测效率
+- **并行化探测**：使用 RunspacePool 真正实现多目标并行探测，可配置工作线程数
 - **重试机制**：探测失败自动重试，减少误判
 - **延迟预警**：网络延迟过高时提前预警（仅基于 Ping 延迟，排除 HTTP/DNS 干扰）
 
@@ -17,21 +17,22 @@
 
 ### 通知系统
 - **本地通知**：网络断开时播放声音 + 系统弹窗提醒（不依赖网络）
-- **钉钉通知**：网络异常和恢复时发送钉钉消息
-- **密钥加密**：钉钉 Secret 使用 Windows DPAPI 加密存储，不存明文
+- **钉钉通知**：网络异常和恢复时发送钉钉消息（异步发送，不阻塞探测循环）
+- **密钥加密**：钉钉 Secret 和 Webhook 均使用 Windows DPAPI 加密存储，不存明文
 - **勿扰模式**：支持自定义时段，勿扰期间钉钉消息延迟发送，结束后统一摘要
 
 ### 数据与面板
 - **Web 状态面板**：每轮探测后自动生成 `status.html`，浏览器打开即可查看实时状态
-- **结构化事件日志**：JSON Lines 格式记录每次探测和事件，支持按日滚动
+- **结构化事件日志**：JSON Lines 格式记录每次探测和事件，支持按日滚动、按大小分片、自动清理过期文件
 - **日报功能**：一键生成指定日期的网络质量日报
 - **日志记录**：所有事件记录到文本日志，支持自动滚动
 
 ### 运维便利
-- **配置热重载**：修改 `config.json` 后自动生效，无需重启
-- **守护进程**：确保监控程序持续运行，意外退出自动重启
+- **配置热重载**：修改 `config.json` 后自动生效，无需重启（含空文件保护）
+- **守护进程**：确保监控程序持续运行，异常退出自动重启；正常退出（Ctrl+C）不重启
+- **进程单例锁**：防止重复启动多个实例，避免文件竞争
 - **首次配置向导**：首次启动自动引导输入配置
-- **向后兼容**：自动迁移旧版 `ping_targets` 和明文 `dingtalk_secret`
+- **向后兼容**：自动迁移旧版 `ping_targets`、明文 `dingtalk_secret` 和 `dingtalk_webhook`
 
 ## 🚀 快速开始
 
@@ -55,16 +56,17 @@
 **适用场景：** 服务器挂机、24小时监控、无人值守、开机自启
 
 双击 `守护进程.bat`：
-- 监控程序意外退出时自动重启
+- 监控程序异常退出时自动重启
+- 按 `Ctrl+C` 正常退出后，守护进程也会停止（不会反复重启）
 - 适合长时间无人值守运行
 - 最小化窗口后可在后台持续运行
-- 按 `Ctrl+C` 停止守护进程
 
 **特点：**
-- 自动保活，程序崩溃后自动重启
+- 自动保活，程序崩溃/异常退出后自动重启
+- 正常退出（Ctrl+C）不会重启
 - 隐藏主程序窗口，通过守护进程窗口查看状态
 - 适合长期挂机运行
-- 需手动按 `Ctrl+C` 停止（不能直接关闭窗口）
+- 按 `Ctrl+C` 停止（正常退出）
 
 ### 3. 开机自动启动（推荐）
 
@@ -152,7 +154,7 @@ powershell -ExecutionPolicy Bypass -File "NetworkMonitor.ps1" -Help
 | `latency_warning_threshold` | `200` | Ping 延迟警告阈值（毫秒） |
 | `alert_cooldown` | `300` | 断网/不稳定告警冷却时间（秒） |
 | `latency_alert_cooldown` | `3600` | 延迟告警独立冷却时间（秒） |
-| `dingtalk_webhook` | `""` | 钉钉机器人 Webhook 地址 |
+| `dingtalk_webhook` | `""` | 钉钉机器人 Webhook 地址（首次加载后自动加密迁移） |
 | `dingtalk_secret_file` | `".dingtalk_secret"` | 加密密钥存储文件路径 |
 | `enable_sound` | `true` | 是否启用声音警报 |
 | `log_file` | `"network_monitor.log"` | 日志文件路径 |
@@ -166,6 +168,9 @@ powershell -ExecutionPolicy Bypass -File "NetworkMonitor.ps1" -Help
 | `web_status_file` | `"status.html"` | Web 状态面板文件路径 |
 | `enable_event_log` | `true` | 是否启用结构化事件日志 |
 | `event_log_file` | `"network_events.jsonl"` | 事件日志基础文件名 |
+| `parallel_workers` | `4` | 并行探测工作线程数（1 = 串行） |
+| `event_log_max_age_days` | `30` | 事件日志保留天数（超过自动删除） |
+| `event_log_max_size_mb` | `50` | 单日事件日志大小上限（MB） |
 
 ### 勿扰模式
 
@@ -254,7 +259,9 @@ windows-powershell/
 ├── config.example.json         # 配置示例（可提交 GitHub）
 ├── config.json                 # 本地配置文件（已加入 .gitignore）
 ├── .dingtalk_secret            # 加密后的钉钉密钥（已加入 .gitignore）
+├── .dingtalk_webhook           # 加密后的钉钉 Webhook（已加入 .gitignore）
 ├── .gitignore                  # Git 忽略配置
+├── .nm_normal_exit             # 正常退出标志文件（守护进程用，运行时生成）
 ├── status.html                 # Web 状态面板（运行时生成）
 ├── network_monitor.log         # 文本日志（运行时生成）
 ├── network_events_*.jsonl      # 结构化事件日志（运行时生成）
@@ -274,9 +281,9 @@ windows-powershell/
 
 ### 密钥安全
 
-- 钉钉 Secret 不再以明文存储在 `config.json` 中
-- 首次输入 Secret 后，程序使用 Windows DPAPI 加密保存到 `.dingtalk_secret`
-- 旧版配置中的明文 Secret 会在首次加载时自动迁移并删除
+- 钉钉 Secret 和 Webhook 均不再以明文存储在 `config.json` 中
+- 首次输入后，程序使用 Windows DPAPI 加密保存到 `.dingtalk_secret` 和 `.dingtalk_webhook`
+- 旧版配置中的明文 Secret 和 Webhook 会在首次加载时自动迁移并删除
 - 如果不小心提交了密钥文件，请立即在钉钉后台重新生成机器人 Secret
 
 ### 关于文件编码（避免中文乱码）
@@ -312,6 +319,33 @@ windows-powershell/
     ↓         ↓
   持续探测  ← 网络恢复 → 恢复通知
 ```
+
+## 🛠️ 问题排查
+
+### 守护进程退出行为
+
+守护进程通过 `.nm_normal_exit` 标志文件判断监控程序是正常退出还是异常退出：
+
+- **正常退出**（Ctrl+C、脚本正常结束）：守护进程读取到标志文件，自身也退出，不再重启
+- **异常退出**（崩溃、未捕获异常、进程被 kill）：标志文件不会被创建，守护进程 5 秒后自动重启监控程序
+
+### 常见错误
+
+| 错误信息 | 原因 | 解决方案 |
+|----------|------|----------|
+| "<"运算符是为将来使用而保留的 | 文件编码错误 | 使用 UTF-8 with BOM 编码重新保存 |
+| 无法加载配置文件 | 配置文件格式错误或为空 | 删除 `config.json` 重新运行 |
+| 钉钉通知失败 | Webhook 或 Secret 配置错误 | 检查钉钉机器人配置 |
+| 文件被另一个进程占用 | 多个实例同时运行 | 确保没有重复启动守护进程 |
+| 网络监控程序已经在运行中 | 全局互斥锁检测到已有实例 | 关闭已有实例后再启动 |
+| 守护进程反复重启 | `.nm_normal_exit` 文件残留 | 删除该文件后再启动守护进程 |
+
+### 调试建议
+
+1. 使用 `-Silent` 参数可减少控制台输出（日志仍写入文件）
+2. 日志文件默认保存在 `network_monitor.log`
+3. 事件日志保存在 `network_events_YYYY-MM-DD.jsonl`，可用文本编辑器或 JSON 工具查看
+4. 遇到问题可先运行 `powershell -ExecutionPolicy Bypass -File "NetworkMonitor.ps1" -Help` 检查语法
 
 ## 📄 许可证
 

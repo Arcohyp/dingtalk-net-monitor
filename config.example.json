@@ -14,6 +14,7 @@
     "unstable_threshold": 30,
     "latency_warning_threshold": 200,
     "alert_cooldown": 300,
+    "latency_alert_cooldown": 3600,
     "dingtalk_webhook": "",
     "dingtalk_secret_file": ".dingtalk_secret",
     "enable_sound": true,
@@ -29,5 +30,8 @@
     "enable_web_panel": false,
     "web_status_file": "status.html",
     "enable_event_log": true,
-    "event_log_file": "network_events.jsonl"
+    "event_log_file": "network_events.jsonl",
+    "parallel_workers": 4,
+    "event_log_max_age_days": 30,
+    "event_log_max_size_mb": 50
 }
