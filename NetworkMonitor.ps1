@@ -1335,7 +1335,13 @@ function Monitor-Network {
 
             Write-EventLog -Type "adapter_change" -Data @{ from = $script:lastAdapter.Name; to = $currentAdapter.Name }
 
-            if ($currentDnd) {
+            # 过滤 ZeroTier 网卡切换，避免钉钉通知轰炸
+            $isZeroTierChange = $currentAdapter.Name -match "ZeroTier|zerotier|Zero Tier" -or
+                               $script:lastAdapter.Name -match "ZeroTier|zerotier|Zero Tier"
+
+            if ($isZeroTierChange) {
+                Write-Log "[过滤] ZeroTier 网卡切换，已拦截钉钉通知" -Level "INFO"
+            } elseif ($currentDnd) {
                 $script:pendingMessages += [PSCustomObject]@{ Type = "adapter_change"; Timestamp = Get-Date; FromName = $script:lastAdapter.Name; ToName = $currentAdapter.Name }
                 Write-Log "[勿扰] 网卡切换通知已延迟发送" -Level "INFO"
             } elseif ($currentTime - $lastAdapterAlertTime -ge $config.alert_cooldown) {
